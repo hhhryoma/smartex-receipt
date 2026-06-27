@@ -84,6 +84,20 @@ LINE_CHANNEL_ACCESS_TOKEN=your_token
 LINE_USER_ID=your_user_id
 ```
 
+## 月末自動実行（Windowsタスクスケジューラ）
+
+毎月25日 21:00に自動実行するタスクを登録できます：
+
+```powershell
+# 登録（管理者権限で実行）
+.\setup-scheduler.ps1
+
+# 解除
+.\setup-scheduler.ps1 -Remove
+```
+
+セッションが保持されている限りOTP不要で動作します。
+
 ## 注意事項
 
 - Playwright（headless Chromium）を使用するため、初回は `npx playwright install chromium` が必要

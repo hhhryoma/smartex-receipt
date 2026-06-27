@@ -288,11 +288,12 @@ async function downloadReceipts(page, context, monthDir, debugDir, year, month) 
   await debugSaveHtml(page, debugDir, '03_history_list');
 
   const allReceipts = [];
+  const usedNames = new Set();
   let pageNum = 1;
 
   while (true) {
     console.log(`[SmartEX] ページ ${pageNum} を処理中...`);
-    const pageReceipts = await processReceiptPage(page, context, monthDir, debugDir, year, month, allReceipts.length);
+    const pageReceipts = await processReceiptPage(page, context, monthDir, debugDir, year, month, allReceipts.length, usedNames);
     allReceipts.push(...pageReceipts);
 
     // 次ページの確認
@@ -306,7 +307,7 @@ async function downloadReceipts(page, context, monthDir, debugDir, year, month) 
   return allReceipts;
 }
 
-async function processReceiptPage(page, context, monthDir, debugDir, year, month, startIndex) {
+async function processReceiptPage(page, context, monthDir, debugDir, year, month, startIndex, usedNames) {
   const receiptBtns = page.locator('input[name="b1"][value="領収書表示"]');
   const totalOnPage = await receiptBtns.count();
   console.log(`[SmartEX] 「領収書表示」ボタン: ${totalOnPage}件`);
@@ -377,7 +378,7 @@ async function processReceiptPage(page, context, monthDir, debugDir, year, month
         await popup.waitForLoadState('domcontentloaded');
         await debugScreenshot(popup, debugDir, `05_receipt_${globalIdx}_print`);
 
-        const pdfName = buildPdfName(info, globalIdx);
+        const pdfName = buildPdfName(info, globalIdx, usedNames);
         const pdfPath = path.join(monthDir, pdfName);
         await popup.pdf({
           path: pdfPath,
@@ -430,11 +431,18 @@ async function extractReceiptInfo(page) {
   });
 }
 
-function buildPdfName(info, index) {
+function buildPdfName(info, index, existingFiles) {
   if (info.rideDate && info.from && info.to) {
     const d = info.rideDate;
     const dateStr = `${d.year}${String(d.month).padStart(2, '0')}${String(d.day).padStart(2, '0')}`;
-    return `${dateStr}_${info.from}_${info.to}.pdf`;
+    let name = `${dateStr}_${info.from}_${info.to}.pdf`;
+    let n = 2;
+    while (existingFiles.has(name)) {
+      name = `${dateStr}_${info.from}_${info.to}_${n}.pdf`;
+      n++;
+    }
+    existingFiles.add(name);
+    return name;
   }
   return `receipt_${String(index).padStart(3, '0')}.pdf`;
 }
