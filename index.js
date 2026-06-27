@@ -86,8 +86,12 @@ async function main() {
   fs.mkdirSync(monthDir, { recursive: true });
   if (IS_DEBUG) fs.mkdirSync(debugDir, { recursive: true });
 
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ acceptDownloads: true });
+  const profileDir = path.join(CONFIG.outputDir, '.browser-profile');
+  fs.mkdirSync(profileDir, { recursive: true });
+  const context = await chromium.launchPersistentContext(profileDir, {
+    headless: true,
+    acceptDownloads: true,
+  });
   const page = await context.newPage();
 
   try {
@@ -119,7 +123,7 @@ async function main() {
     }
     throw err;
   } finally {
-    await browser.close();
+    await context.close();
   }
 }
 
