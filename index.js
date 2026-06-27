@@ -15,6 +15,34 @@ const CONFIG = {
 
 const IS_DEBUG = process.argv.includes('--debug');
 const SMARTEX_LOGIN_URL = 'https://shinkansen2.jr-central.co.jp/RSV_P/smart_index.htm';
+const OTP_MAX_RETRIES = 3;
+
+function parseArgs() {
+  const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+  const flags = process.argv.slice(2);
+  let year, month;
+
+  const monthIdx = flags.indexOf('--month');
+  if (monthIdx !== -1 && flags[monthIdx + 1]) {
+    const val = flags[monthIdx + 1];
+    const m = val.match(/^(\d{4})-(\d{1,2})$/);
+    if (m) {
+      year = parseInt(m[1]);
+      month = parseInt(m[2]);
+    } else {
+      console.error('エラー: --month は YYYY-MM 形式で指定してください（例: --month 2026-05）');
+      process.exit(1);
+    }
+  }
+
+  if (!year || !month) {
+    const now = new Date();
+    year = now.getFullYear();
+    month = now.getMonth() + 1;
+  }
+
+  return { year, month };
+}
 
 function waitForOtp(filePath, timeoutMs) {
   return new Promise((resolve) => {
@@ -39,44 +67,50 @@ function waitForOtp(filePath, timeoutMs) {
 async function main() {
   validateConfig();
 
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth() + 1;
+  const { year, month } = parseArgs();
   const monthStr = `${year}年${month}月`;
+  const monthKey = `${year}-${String(month).padStart(2, '0')}`;
   console.log(`[SmartEX] ${monthStr}分の領収書を取得します...`);
 
-  const monthDir = path.join(CONFIG.outputDir, `${year}-${String(month).padStart(2, '0')}`);
+  const monthDir = path.join(CONFIG.outputDir, monthKey);
   const debugDir = path.join(CONFIG.outputDir, 'debug');
+
+  // 再実行時は前回のPDFをクリア
+  if (fs.existsSync(monthDir)) {
+    const oldFiles = fs.readdirSync(monthDir).filter((f) => f.endsWith('.pdf'));
+    if (oldFiles.length > 0) {
+      console.log(`[SmartEX] 前回のPDF ${oldFiles.length}件を削除します`);
+      oldFiles.forEach((f) => fs.unlinkSync(path.join(monthDir, f)));
+    }
+  }
   fs.mkdirSync(monthDir, { recursive: true });
   if (IS_DEBUG) fs.mkdirSync(debugDir, { recursive: true });
 
-  // page.pdf()はheadless必須
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ acceptDownloads: true });
   const page = await context.newPage();
 
   try {
     await login(page, debugDir);
-    const receiptCount = await downloadReceipts(page, context, monthDir, debugDir, year, month);
+    const receipts = await downloadReceipts(page, context, monthDir, debugDir, year, month);
 
-    if (receiptCount === 0) {
+    if (receipts.length === 0) {
       console.log(`[SmartEX] ${monthStr}分の領収書はありませんでした。`);
-      await browser.close();
       return { month: monthStr, count: 0 };
     }
 
-    console.log(`[SmartEX] ${receiptCount}件の領収書をダウンロードしました。`);
+    console.log(`[SmartEX] ${receipts.length}件の領収書をダウンロードしました。`);
 
-    const archivePath = path.join(CONFIG.outputDir, `smartex_receipts_${year}-${String(month).padStart(2, '0')}.7z`);
+    const archivePath = path.join(CONFIG.outputDir, `smartex_receipts_${monthKey}.7z`);
     await compress7z(monthDir, archivePath);
     console.log(`[SmartEX] 7z圧縮完了: ${archivePath}`);
 
     if (CONFIG.lineToken && CONFIG.lineUserId) {
-      await sendLineNotification(monthStr, receiptCount, archivePath);
+      await sendLineNotification(monthStr, receipts, archivePath);
     }
 
     console.log(`[SmartEX] 完了！ファイル: ${archivePath}`);
-    return { month: monthStr, count: receiptCount, file: archivePath };
+    return { month: monthStr, count: receipts.length, file: archivePath };
   } catch (err) {
     console.error('[SmartEX] エラー:', err.message);
     if (IS_DEBUG) {
@@ -98,8 +132,7 @@ function validateConfig() {
 
 async function debugScreenshot(page, debugDir, name) {
   if (!IS_DEBUG) return;
-  const filePath = path.join(debugDir, `${name}.png`);
-  await page.screenshot({ path: filePath, fullPage: true });
+  await page.screenshot({ path: path.join(debugDir, `${name}.png`), fullPage: true });
   console.log(`[DEBUG] ${name}: ${page.url()}`);
 }
 
@@ -114,9 +147,9 @@ async function login(page, debugDir) {
   await page.goto(SMARTEX_LOGIN_URL, { waitUntil: 'domcontentloaded' });
   await debugScreenshot(page, debugDir, '01_login_page');
 
-  await page.fill('input[name="01"]', CONFIG.memberId);
-  await page.fill('input[name="02"]', CONFIG.password);
-  await page.click('input[type="submit"][value="ログイン"]');
+  await page.locator('input[name="01"]').fill(CONFIG.memberId);
+  await page.locator('input[name="02"]').fill(CONFIG.password);
+  await page.locator('input[type="submit"][value="ログイン"]').click();
 
   await page.waitForURL((url) => !url.href.includes('smart_index'), { timeout: 30000 }).catch(() => {});
   await page.waitForLoadState('domcontentloaded');
@@ -126,24 +159,31 @@ async function login(page, debugDir) {
     throw new Error('ログインに失敗しました。会員IDとパスワードを確認してください。');
   }
 
-  const pageText = await page.textContent('body');
-  if (pageText.includes('ワンタイムパスワード')) {
-    console.log('[SmartEX] SMS認証が必要です。');
-    await debugSaveHtml(page, debugDir, '02_otp_page');
+  const bodyText = await page.locator('body').textContent();
+  if (!bodyText.includes('ワンタイムパスワード')) {
+    console.log('[SmartEX] ログイン成功');
+    return;
+  }
 
-    const smsBtn = await page.$('input[value*="SMS送信"], a:has-text("SMS送信"), button:has-text("SMS送信")');
-    if (smsBtn) {
-      await smsBtn.click();
-      await page.waitForTimeout(2000);
-      await page.evaluate(() => {
-        document.querySelectorAll('.LBX-curtain, .LBX-window, [class*="LBX"]').forEach((el) => el.remove());
-      });
-      await page.waitForTimeout(1000);
-      console.log('[SmartEX] SMSを送信しました。');
-    }
+  console.log('[SmartEX] SMS認証が必要です。');
+  await debugSaveHtml(page, debugDir, '02_otp_page');
 
+  const smsBtn = page.locator('input[value*="SMS送信"], a:has-text("SMS送信"), button:has-text("SMS送信")').first();
+  if (await smsBtn.count() > 0) {
+    await smsBtn.click();
+    await page.waitForLoadState('domcontentloaded');
+    await removeLightbox(page);
+    console.log('[SmartEX] SMSを送信しました。');
+  }
+
+  // OTPリトライループ
+  for (let attempt = 1; attempt <= OTP_MAX_RETRIES; attempt++) {
     const otpFile = path.join(CONFIG.outputDir, 'otp.txt');
     if (fs.existsSync(otpFile)) fs.unlinkSync(otpFile);
+
+    if (attempt > 1) {
+      console.log(`[SmartEX] OTP再入力 (${attempt}/${OTP_MAX_RETRIES})...`);
+    }
     console.log(`[SmartEX] OTP待ち: ${otpFile} にワンタイムパスワードを書き込んでください...`);
     console.log('[SmartEX] ※SMSに届いた最新の6桁コードを書き込んでください');
 
@@ -151,77 +191,96 @@ async function login(page, debugDir) {
     if (!otp) throw new Error('ワンタイムパスワードがタイムアウトしました。');
     console.log(`[SmartEX] OTP受信: ${otp}`);
 
-    // OTP入力フィールドを探す（複数のセレクタで試行）
-    let otpInput = await page.$('input[type="tel"]');
-    if (!otpInput) otpInput = await page.$('input[placeholder*="6桁"]');
-    if (!otpInput) otpInput = await page.$('input[placeholder*="数字"]');
-    if (!otpInput) otpInput = await page.$('input[placeholder*="半角"]');
-    if (!otpInput) {
-      // フォーム内のテキスト入力を探す
-      otpInput = await page.evaluate(() => {
-        const inputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"]');
-        for (const input of inputs) {
-          if (input.name && !input.name.startsWith('_')) return input.name;
-        }
-        return null;
-      });
-      if (otpInput) {
-        console.log(`[SmartEX] OTP入力フィールド発見（name="${otpInput}"）`);
-        await page.fill(`input[name="${otpInput}"]`, otp);
-      } else {
-        console.warn('[SmartEX] OTP入力フィールドが見つかりません');
-      }
-    } else {
-      const inputName = await otpInput.getAttribute('name');
-      console.log(`[SmartEX] OTP入力フィールド発見（name="${inputName}"）`);
-      await otpInput.fill(otp);
-    }
-
+    await fillOtpField(page, otp);
     await debugScreenshot(page, debugDir, '02c_otp_filled');
-
-    await page.evaluate(() => {
-      document.querySelectorAll('.LBX-curtain, .LBX-window').forEach((el) => el.remove());
-    });
-
-    // OK/次へボタンをクリック
-    let okBtn = await page.$('input[value*="OK 次へ"]');
-    if (!okBtn) okBtn = await page.$('input[value*="OK"]');
-    if (!okBtn) okBtn = await page.$('a:has-text("OK")');
-    if (!okBtn) {
-      // フォールバック: submit系ボタンを探す
-      okBtn = await page.evaluate(() => {
-        const btns = document.querySelectorAll('input[type="submit"], button[type="submit"], a');
-        for (const btn of btns) {
-          const text = btn.value || btn.textContent || '';
-          if (text.includes('OK') || text.includes('次へ')) return true;
-        }
-        return false;
-      });
-    }
-    if (okBtn && typeof okBtn !== 'boolean') {
-      await okBtn.click({ force: true });
-    } else {
-      // JS経由でクリック
-      await page.evaluate(() => {
-        const btns = document.querySelectorAll('input[type="submit"], button[type="submit"], a');
-        for (const btn of btns) {
-          const text = btn.value || btn.textContent || '';
-          if (text.includes('OK') || text.includes('次へ')) { btn.click(); return; }
-        }
-      });
-    }
+    await removeLightbox(page);
+    await clickOkButton(page);
     await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(1500);
     await debugScreenshot(page, debugDir, '02d_after_otp');
 
-    // OTPエラーチェック
-    const afterOtpText = await page.textContent('body');
-    if (afterOtpText.includes('正しくありません') || afterOtpText.includes('無効')) {
-      throw new Error('ワンタイムパスワードが正しくありません。最新のSMSコードを確認して再実行してください。');
+    const afterText = await page.locator('body').textContent();
+    if (afterText.includes('正しくありません') || afterText.includes('無効')) {
+      console.warn('[SmartEX] OTPが正しくありません。');
+      if (attempt >= OTP_MAX_RETRIES) {
+        throw new Error(`ワンタイムパスワードが${OTP_MAX_RETRIES}回失敗しました。`);
+      }
+      continue;
+    }
+
+    console.log('[SmartEX] ログイン成功');
+    return;
+  }
+}
+
+async function removeLightbox(page) {
+  await page.evaluate(() => {
+    document.querySelectorAll('.LBX-curtain, .LBX-window, [class*="LBX"]').forEach((el) => el.remove());
+  });
+}
+
+async function fillOtpField(page, otp) {
+  // name="tx01" が既知のフィールド名。フォールバックで他のセレクタも試す
+  const selectors = [
+    'input[name="tx01"]',
+    'input[type="tel"]',
+    'input[placeholder*="6桁"]',
+    'input[placeholder*="数字"]',
+    'input[placeholder*="半角"]',
+  ];
+
+  for (const sel of selectors) {
+    const field = page.locator(sel).first();
+    if (await field.count() > 0) {
+      const name = await field.getAttribute('name');
+      console.log(`[SmartEX] OTP入力フィールド発見（name="${name}"）`);
+      await field.fill(otp);
+      return;
     }
   }
 
-  console.log('[SmartEX] ログイン成功');
+  // フォールバック: 隠しでないテキスト系inputを探す
+  const fallbackName = await page.evaluate(() => {
+    const inputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"]');
+    for (const input of inputs) {
+      if (input.name && !input.name.startsWith('_')) return input.name;
+    }
+    return null;
+  });
+
+  if (fallbackName) {
+    console.log(`[SmartEX] OTP入力フィールド発見（name="${fallbackName}"）`);
+    await page.locator(`input[name="${fallbackName}"]`).fill(otp);
+  } else {
+    console.warn('[SmartEX] OTP入力フィールドが見つかりません');
+  }
+}
+
+async function clickOkButton(page) {
+  const selectors = [
+    'input[value*="OK 次へ"]',
+    'input[value*="OK"]',
+    'a:has-text("OK")',
+  ];
+
+  for (const sel of selectors) {
+    const btn = page.locator(sel).first();
+    if (await btn.count() > 0) {
+      await btn.click({ force: true });
+      return;
+    }
+  }
+
+  // フォールバック: JS経由
+  await page.evaluate(() => {
+    const btns = document.querySelectorAll('input[type="submit"], button[type="submit"], a');
+    for (const btn of btns) {
+      const text = btn.value || btn.textContent || '';
+      if (text.includes('OK') || text.includes('次へ')) {
+        btn.click();
+        return;
+      }
+    }
+  });
 }
 
 async function downloadReceipts(page, context, monthDir, debugDir, year, month) {
@@ -229,76 +288,86 @@ async function downloadReceipts(page, context, monthDir, debugDir, year, month) 
 
   await navigateToHistory(page);
   await debugScreenshot(page, debugDir, '03_history_list_before_filter');
-
-  await debugScreenshot(page, debugDir, '03_history_list');
   await debugSaveHtml(page, debugDir, '03_history_list');
 
-  // 「領収書表示」ボタンの数を取得（name="b1", value="領収書表示"）
-  const receiptCount_total = await page.locator('input[name="b1"][value="領収書表示"]').count();
-  console.log(`[SmartEX] 「領収書表示」ボタン: ${receiptCount_total}件`);
+  const allReceipts = [];
+  let pageNum = 1;
 
-  if (receiptCount_total === 0) {
-    console.log('[SmartEX] 当月の領収書が見つかりませんでした。');
-    return 0;
+  while (true) {
+    console.log(`[SmartEX] ページ ${pageNum} を処理中...`);
+    const pageReceipts = await processReceiptPage(page, context, monthDir, debugDir, year, month, allReceipts.length);
+    allReceipts.push(...pageReceipts);
+
+    // 次ページの確認
+    const hasNext = await goToNextPage(page);
+    if (!hasNext) break;
+    pageNum++;
+    await page.waitForLoadState('domcontentloaded');
+    await debugScreenshot(page, debugDir, `03_history_list_page${pageNum}`);
   }
 
-  let receiptCount = 0;
+  return allReceipts;
+}
 
-  for (let i = 0; i < receiptCount_total; i++) {
-    console.log(`[SmartEX] 領収書 ${i + 1}/${receiptCount_total} を処理中...`);
+async function processReceiptPage(page, context, monthDir, debugDir, year, month, startIndex) {
+  const receiptBtns = page.locator('input[name="b1"][value="領収書表示"]');
+  const totalOnPage = await receiptBtns.count();
+  console.log(`[SmartEX] 「領収書表示」ボタン: ${totalOnPage}件`);
+
+  if (totalOnPage === 0) return [];
+
+  const receipts = [];
+
+  for (let i = 0; i < totalOnPage; i++) {
+    const globalIdx = startIndex + i + 1;
+    console.log(`[SmartEX] 領収書 ${globalIdx} を処理中...`);
 
     try {
-      // 現在のページで i番目の「領収書表示」ボタンをクリック
-      const receiptBtn = page.locator('input[name="b1"][value="領収書表示"]').nth(i);
-      const btnCount = await page.locator('input[name="b1"][value="領収書表示"]').count();
-      if (i >= btnCount) {
-        console.warn(`[SmartEX] 領収書 ${i + 1}: ボタンが見つかりません（現在${btnCount}個）。終了。`);
+      const btn = page.locator('input[name="b1"][value="領収書表示"]').nth(i);
+      const currentCount = await page.locator('input[name="b1"][value="領収書表示"]').count();
+      if (i >= currentCount) {
+        console.warn(`[SmartEX] 領収書 ${globalIdx}: ボタンが見つかりません（残り${currentCount}個）。終了。`);
         break;
       }
 
-      await receiptBtn.scrollIntoViewIfNeeded();
+      await btn.scrollIntoViewIfNeeded();
       await Promise.all([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
-        receiptBtn.click({ force: true }),
+        btn.click({ force: true }),
       ]);
-      await page.waitForTimeout(1500);
-      await debugScreenshot(page, debugDir, `04_receipt_${i + 1}_page`);
-      await debugSaveHtml(page, debugDir, `04_receipt_${i + 1}_page`);
+      await debugScreenshot(page, debugDir, `04_receipt_${globalIdx}_page`);
+      await debugSaveHtml(page, debugDir, `04_receipt_${globalIdx}_page`);
 
-      // 領収書ページかチェック（印刷ボタンが存在するか）
-      const printBtn = await page.$('input[name="b1"][value="印刷"]');
-      if (!printBtn) {
-        const bodyText = await page.textContent('body').catch(() => '');
-        console.warn(`[SmartEX] 領収書 ${i + 1}: 印刷ボタンなし。ページ内容: ${bodyText.substring(0, 100)}`);
+      // 印刷ボタン確認
+      const hasPrint = await page.locator('input[name="b1"][value="印刷"]').count() > 0;
+      if (!hasPrint) {
+        const bodySnippet = await page.locator('body').textContent().catch(() => '');
+        console.warn(`[SmartEX] 領収書 ${globalIdx}: 印刷ボタンなし。内容: ${bodySnippet.substring(0, 100)}`);
         await clickBackButton(page);
-        await page.waitForTimeout(1000);
         continue;
       }
 
-      // 乗車日を読み取り、当月分かチェック
-      const rideDate = await page.evaluate(() => {
-        const body = document.body.textContent;
-        const m = body.match(/乗車日\s*(\d{4})年(\d{1,2})月(\d{1,2})日/);
-        return m ? { year: parseInt(m[1]), month: parseInt(m[2]), day: parseInt(m[3]) } : null;
-      });
+      // 乗車日・区間を読み取る
+      const info = await extractReceiptInfo(page);
 
-      if (rideDate) {
-        console.log(`[SmartEX] 領収書 ${i + 1}: 乗車日 ${rideDate.year}年${rideDate.month}月${rideDate.day}日`);
-        if (rideDate.year !== year || rideDate.month !== month) {
-          console.log(`[SmartEX] 領収書 ${i + 1}: 当月(${month}月)分ではないためスキップ`);
+      if (info.rideDate) {
+        console.log(`[SmartEX] 領収書 ${globalIdx}: 乗車日 ${info.rideDate.year}年${info.rideDate.month}月${info.rideDate.day}日 ${info.from}→${info.to}`);
+        if (info.rideDate.year !== year || info.rideDate.month !== month) {
+          console.log(`[SmartEX] 領収書 ${globalIdx}: 当月(${month}月)分ではないためスキップ`);
           await clickBackButton(page);
-          await page.waitForTimeout(1000);
           continue;
         }
       }
 
-      // 宛名入力（i1=1行目）
+      // 宛名入力
       if (CONFIG.addressee) {
-        const i1 = await page.$('input[name="i1"]');
-        if (i1) await i1.fill(CONFIG.addressee);
+        const addressField = page.locator('input[name="i1"]');
+        if (await addressField.count() > 0) {
+          await addressField.fill(CONFIG.addressee);
+        }
       }
 
-      // 印刷ボタンクリック → 新しいウィンドウが開く
+      // 印刷ボタンクリック → ポップアップでPDF保存
       const [popup] = await Promise.all([
         context.waitForEvent('page', { timeout: 15000 }).catch(() => null),
         page.evaluate(() => {
@@ -309,60 +378,93 @@ async function downloadReceipts(page, context, monthDir, debugDir, year, month) 
 
       if (popup) {
         await popup.waitForLoadState('domcontentloaded');
-        await popup.waitForTimeout(3000);
-        await debugScreenshot(popup, debugDir, `05_receipt_${i + 1}_print`);
+        await debugScreenshot(popup, debugDir, `05_receipt_${globalIdx}_print`);
 
-        const pdfPath = path.join(monthDir, `receipt_${String(i + 1).padStart(3, '0')}.pdf`);
+        const pdfName = buildPdfName(info, globalIdx);
+        const pdfPath = path.join(monthDir, pdfName);
         await popup.pdf({
           path: pdfPath,
           format: 'A4',
           printBackground: true,
           margin: { top: '10mm', right: '10mm', bottom: '10mm', left: '10mm' },
         });
-        receiptCount++;
+        receipts.push({ index: globalIdx, file: pdfName, ...info });
         console.log(`[SmartEX] 保存: ${pdfPath}`);
         await popup.close();
       } else {
-        console.warn(`[SmartEX] 領収書 ${i + 1}: 印刷ウィンドウが開きませんでした。`);
+        console.warn(`[SmartEX] 領収書 ${globalIdx}: 印刷ウィンドウが開きませんでした。`);
       }
 
-      // 戻るボタンで一覧に戻る
       await clickBackButton(page);
-      await page.waitForTimeout(1000);
-      await debugScreenshot(page, debugDir, `06_back_to_list_${i + 1}`);
-
+      await debugScreenshot(page, debugDir, `06_back_to_list_${globalIdx}`);
     } catch (err) {
-      console.warn(`[SmartEX] 領収書 ${i + 1} でエラー: ${err.message}`);
-      if (IS_DEBUG) await debugScreenshot(page, debugDir, `error_receipt_${i + 1}`);
+      console.warn(`[SmartEX] 領収書 ${globalIdx} でエラー: ${err.message}`);
+      if (IS_DEBUG) await debugScreenshot(page, debugDir, `error_receipt_${globalIdx}`);
       await clickBackButton(page).catch(() => {});
-      await page.waitForTimeout(1000);
     }
   }
 
-  return receiptCount;
+  return receipts;
+}
+
+async function extractReceiptInfo(page) {
+  return page.evaluate(() => {
+    const body = document.body.textContent;
+    const dateMatch = body.match(/乗車日\s*(\d{4})年(\d{1,2})月(\d{1,2})日/);
+
+    const stationTable = document.querySelector('table.station');
+    let from = '';
+    let to = '';
+    if (stationTable) {
+      const spans = stationTable.querySelectorAll('span');
+      if (spans.length >= 2) {
+        from = spans[0].textContent.trim();
+        to = spans[1].textContent.trim();
+      }
+    }
+
+    return {
+      rideDate: dateMatch
+        ? { year: parseInt(dateMatch[1]), month: parseInt(dateMatch[2]), day: parseInt(dateMatch[3]) }
+        : null,
+      from,
+      to,
+    };
+  });
+}
+
+function buildPdfName(info, index) {
+  if (info.rideDate && info.from && info.to) {
+    const d = info.rideDate;
+    const dateStr = `${d.year}${String(d.month).padStart(2, '0')}${String(d.day).padStart(2, '0')}`;
+    return `${dateStr}_${info.from}_${info.to}.pdf`;
+  }
+  return `receipt_${String(index).padStart(3, '0')}.pdf`;
 }
 
 async function navigateToHistory(page) {
-  const links = await page.$$('a[onclick*="cfEXPY_doAction"]');
-  for (const link of links) {
-    const text = await link.textContent().catch(() => '');
+  const links = page.locator('a[onclick*="cfEXPY_doAction"]');
+  const count = await links.count();
+
+  for (let i = 0; i < count; i++) {
+    const text = await links.nth(i).textContent().catch(() => '');
     if (text.includes('利用履歴') || text.includes('領収書') || text.includes('購入履歴')) {
       console.log(`[SmartEX] メニュー遷移: "${text.trim()}"`);
-      await link.click();
+      await links.nth(i).click();
       await page.waitForLoadState('domcontentloaded');
-      await page.waitForTimeout(1000);
       return;
     }
   }
 
-  const allLinks = await page.$$('a');
-  for (const link of allLinks) {
-    const text = await link.textContent().catch(() => '');
+  // フォールバック: 全リンクから探す
+  const allLinks = page.locator('a');
+  const allCount = await allLinks.count();
+  for (let i = 0; i < allCount; i++) {
+    const text = await allLinks.nth(i).textContent().catch(() => '');
     if (text && (text.includes('利用履歴') || text.includes('購入履歴'))) {
       console.log(`[SmartEX] リンク遷移: "${text.trim()}"`);
-      await link.click();
+      await allLinks.nth(i).click();
       await page.waitForLoadState('domcontentloaded');
-      await page.waitForTimeout(1000);
       return;
     }
   }
@@ -370,10 +472,25 @@ async function navigateToHistory(page) {
   console.warn('[SmartEX] 利用履歴リンクが見つかりません。現在のページを使用します。');
 }
 
+async function goToNextPage(page) {
+  // div.pager 内の「次へ」リンクを探す
+  const pager = page.locator('div.pager');
+  if (await pager.count() === 0) return false;
+
+  const nextLink = pager.locator('a:has-text("次へ"), a:has-text("次のページ"), a.next');
+  if (await nextLink.count() === 0) return false;
+
+  console.log('[SmartEX] 次のページへ遷移...');
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+    nextLink.first().click(),
+  ]);
+  return true;
+}
+
 async function clickBackButton(page) {
-  // 戻るボタンを探す: button[name="b2"] または button[name="b5"] または value="戻る"
-  const backBtn = await page.$('button[name="b2"], button[name="b5"], input[value="戻る"], button:has-text("戻る")');
-  if (backBtn) {
+  const backBtn = page.locator('button[name="b2"], button[name="b5"], input[value="戻る"], button:has-text("戻る")').first();
+  if (await backBtn.count() > 0) {
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
       backBtn.click({ force: true }),
@@ -394,19 +511,27 @@ function compress7z(sourceDir, archivePath) {
   });
 }
 
-async function sendLineNotification(monthStr, receiptCount, archivePath) {
+async function sendLineNotification(monthStr, receipts, archivePath) {
   const fileSize = fs.statSync(archivePath).size;
   const fileSizeKB = Math.round(fileSize / 1024);
+
+  const receiptList = receipts
+    .map((r) => {
+      if (r.rideDate && r.from && r.to) {
+        return `  ${r.rideDate.month}/${r.rideDate.day} ${r.from}→${r.to}`;
+      }
+      return `  ${r.file}`;
+    })
+    .join('\n');
 
   const message = [
     `SmartEX 領収書取得完了`,
     ``,
     `期間: ${monthStr}`,
-    `件数: ${receiptCount}件`,
-    `ファイル: ${path.basename(archivePath)}`,
-    `サイズ: ${fileSizeKB}KB`,
+    `件数: ${receipts.length}件`,
+    receiptList,
     ``,
-    `保存先: ${archivePath}`,
+    `ファイル: ${path.basename(archivePath)} (${fileSizeKB}KB)`,
   ].join('\n');
 
   try {
