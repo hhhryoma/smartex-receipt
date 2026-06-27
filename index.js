@@ -260,31 +260,24 @@ async function fillOtpField(page, otp) {
 }
 
 async function clickOkButton(page) {
-  const selectors = [
-    'input[value*="OK 次へ"]',
-    'input[value*="OK"]',
-    'a:has-text("OK")',
-  ];
-
-  for (const sel of selectors) {
-    const btn = page.locator(sel).first();
-    if (await btn.count() > 0) {
-      await btn.click({ force: true });
-      return;
-    }
-  }
-
-  // フォールバック: JS経由
-  await page.evaluate(() => {
-    const btns = document.querySelectorAll('input[type="submit"], button[type="submit"], a');
+  // OTPページのボタンは input[name="b2"][value="次へ"] (opacity:0)
+  // cfEXPY_doAction経由で送信するため、JS側から直接呼ぶ
+  const clicked = await page.evaluate(() => {
+    // name="b2" の次へボタンを優先
+    const b2 = document.querySelector('input[type="submit"][name="b2"]');
+    if (b2) { b2.click(); return 'b2'; }
+    const btns = document.querySelectorAll('input[type="submit"], button[type="submit"]');
     for (const btn of btns) {
       const text = btn.value || btn.textContent || '';
-      if (text.includes('OK') || text.includes('次へ')) {
-        btn.click();
-        return;
-      }
+      if (text.includes('次へ') || text.includes('OK')) { btn.click(); return text; }
     }
+    return null;
   });
+  if (clicked) {
+    console.log(`[SmartEX] ボタンクリック: ${clicked}`);
+  } else {
+    console.warn('[SmartEX] OK/次へボタンが見つかりません');
+  }
 }
 
 async function downloadReceipts(page, context, monthDir, debugDir, year, month) {
