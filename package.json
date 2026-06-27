@@ -1,0 +1,15 @@
+{
+  "name": "smartex-receipt",
+  "version": "1.0.0",
+  "description": "スマートEX領収書自動取得ツール",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "setup": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0",
+    "7zip-min": "^1.4.5",
+    "dotenv": "^16.4.7"
+  }
+}
