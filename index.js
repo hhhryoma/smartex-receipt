@@ -14,6 +14,7 @@ const CONFIG = {
 };
 
 const IS_DEBUG = process.argv.includes('--debug');
+const NO_COMPRESS = process.argv.includes('--no-compress');
 const SMARTEX_LOGIN_URL = 'https://shinkansen2.jr-central.co.jp/RSV_P/smart_index.htm';
 const OTP_MAX_RETRIES = 3;
 
@@ -104,6 +105,14 @@ async function main() {
     }
 
     console.log(`[SmartEX] ${receipts.length}件の領収書をダウンロードしました。`);
+
+    if (NO_COMPRESS) {
+      console.log(`[SmartEX] 完了！フォルダ: ${monthDir}`);
+      if (CONFIG.lineToken && CONFIG.lineUserId) {
+        await sendLineNotification(monthStr, receipts, null);
+      }
+      return { month: monthStr, count: receipts.length, dir: monthDir };
+    }
 
     const archivePath = path.join(CONFIG.outputDir, `smartex_receipts_${monthKey}.7z`);
     await compress7z(monthDir, archivePath);
@@ -517,9 +526,6 @@ function compress7z(sourceDir, archivePath) {
 }
 
 async function sendLineNotification(monthStr, receipts, archivePath) {
-  const fileSize = fs.statSync(archivePath).size;
-  const fileSizeKB = Math.round(fileSize / 1024);
-
   const receiptList = receipts
     .map((r) => {
       if (r.rideDate && r.from && r.to) {
@@ -529,15 +535,20 @@ async function sendLineNotification(monthStr, receipts, archivePath) {
     })
     .join('\n');
 
-  const message = [
+  const lines = [
     `SmartEX 領収書取得完了`,
     ``,
     `期間: ${monthStr}`,
     `件数: ${receipts.length}件`,
     receiptList,
-    ``,
-    `ファイル: ${path.basename(archivePath)} (${fileSizeKB}KB)`,
-  ].join('\n');
+  ];
+
+  if (archivePath) {
+    const fileSizeKB = Math.round(fs.statSync(archivePath).size / 1024);
+    lines.push(``, `ファイル: ${path.basename(archivePath)} (${fileSizeKB}KB)`);
+  }
+
+  const message = lines.join('\n');
 
   try {
     const response = await fetch('https://api.line.me/v2/bot/message/push', {
