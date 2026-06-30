@@ -1,4 +1,6 @@
 node_modules/
 .env
-output/
-.browser-profile/
+output/debug/
+output/otp.txt
+output/.browser-profile/
+output/smartex_receipts_*.7z
