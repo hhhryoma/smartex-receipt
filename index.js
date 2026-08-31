@@ -483,7 +483,17 @@ async function navigateToHistory(page) {
     }
   }
 
-  console.warn('[SmartEX] 利用履歴リンクが見つかりません。現在のページを使用します。');
+  // 23:30〜翌5:30の夜間時間帯は「ご利用履歴・領収書の発行」がリンクではなく
+  // article.disabled として描画され、押せなくなる
+  const disabledReceipt = page.locator('article.receipt.disabled');
+  if (await disabledReceipt.count() > 0) {
+    throw new Error(
+      '「ご利用履歴・領収書の発行」が無効化されています。' +
+        '夜間時間帯（23:30〜翌5:30）は利用できないため、時間帯を変えて再実行してください。'
+    );
+  }
+
+  throw new Error('利用履歴・領収書メニューが見つかりません。サイトの構成が変わった可能性があります。');
 }
 
 async function goToNextPage(page) {
