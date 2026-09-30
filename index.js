@@ -76,14 +76,9 @@ async function main() {
   const monthDir = path.join(CONFIG.outputDir, monthKey);
   const debugDir = path.join(CONFIG.outputDir, 'debug');
 
-  // 再実行時は前回のPDFをクリア
-  if (fs.existsSync(monthDir)) {
-    const oldFiles = fs.readdirSync(monthDir).filter((f) => f.endsWith('.pdf'));
-    if (oldFiles.length > 0) {
-      console.log(`[SmartEX] 前回のPDF ${oldFiles.length}件を削除します`);
-      oldFiles.forEach((f) => fs.unlinkSync(path.join(monthDir, f)));
-    }
-  }
+  // 事前クリアはしない。照会期間は請求書記載日ベースなので、ある月のフォルダには
+  // 別の月を照会したときに保存された乗車分が入っていることがあり、消すと取りこぼす。
+  // ファイル名は「乗車日_区間」で決まるため、同じ領収書は上書きされる。
   fs.mkdirSync(monthDir, { recursive: true });
   if (IS_DEBUG) fs.mkdirSync(debugDir, { recursive: true });
 
@@ -293,6 +288,8 @@ async function downloadReceipts(page, context, monthDir, debugDir, year, month) 
   console.log('[SmartEX] 領収書一覧を取得中...');
 
   await navigateToHistory(page);
+  await setQueryPeriod(page, year, month);
+  await waitForReceiptList(page);
   await debugScreenshot(page, debugDir, '03_history_list_before_filter');
   await debugSaveHtml(page, debugDir, '03_history_list');
 
@@ -357,12 +354,17 @@ async function processReceiptPage(page, context, monthDir, debugDir, year, month
       // 乗車日・区間を読み取る
       const info = await extractReceiptInfo(page);
 
+      // 照会期間は請求書記載日ベースなので、月末購入・翌月乗車のように
+      // 乗車月が照会月とズレることがある。スキップすると恒久的に取りこぼすため、
+      // 乗車月のフォルダに振り分けて保存する。
+      let targetDir = monthDir;
       if (info.rideDate) {
         console.log(`[SmartEX] 領収書 ${globalIdx}: 乗車日 ${info.rideDate.year}年${info.rideDate.month}月${info.rideDate.day}日 ${info.from}→${info.to}`);
         if (info.rideDate.year !== year || info.rideDate.month !== month) {
-          console.log(`[SmartEX] 領収書 ${globalIdx}: 当月(${month}月)分ではないためスキップ`);
-          await clickBackButton(page);
-          continue;
+          const rideKey = `${info.rideDate.year}-${String(info.rideDate.month).padStart(2, '0')}`;
+          targetDir = path.join(CONFIG.outputDir, rideKey);
+          fs.mkdirSync(targetDir, { recursive: true });
+          console.log(`[SmartEX] 領収書 ${globalIdx}: 乗車月が照会月(${month}月)と異なるため ${rideKey}/ に保存します`);
         }
       }
 
@@ -388,7 +390,7 @@ async function processReceiptPage(page, context, monthDir, debugDir, year, month
         await debugScreenshot(popup, debugDir, `05_receipt_${globalIdx}_print`);
 
         const pdfName = buildPdfName(info, globalIdx, usedNames);
-        const pdfPath = path.join(monthDir, pdfName);
+        const pdfPath = path.join(targetDir, pdfName);
         await popup.pdf({
           path: pdfPath,
           format: 'A4',
@@ -454,6 +456,64 @@ function buildPdfName(info, index, existingFiles) {
     return name;
   }
   return `receipt_${String(index).padStart(3, '0')}.pdf`;
+}
+
+// ご利用履歴の照会期間（請求書記載日ベース）を指定月の1日〜末日に設定する。
+// 指定しないとサイト側の既定期間（1日に実行すると前月）に依存し、
+// 期間外の月を --month に渡すと黙って0件になる。
+async function setQueryPeriod(page, year, month) {
+  // 履歴ページは遷移直後だとまだ描画されていないことがあるので明示的に待つ
+  const fromMonth = page.locator('select[name="sel-1"]');
+  try {
+    await page.waitForSelector('select[name="sel-1"]', { timeout: 20000 });
+  } catch {
+    console.warn('[SmartEX] 照会期間の選択欄が見つかりません。既定の期間で続行します。');
+    return;
+  }
+
+  // ページ側のJS(cfEXPY)が初期化される前にアクションを呼ぶと黙って無視されるため待つ
+  await page.waitForLoadState('load').catch(() => {});
+  await page.waitForFunction(() => typeof window.cfEXPY_doAction === 'function', undefined, { timeout: 20000 });
+  await page.waitForTimeout(1500);
+
+  const ym = `${year}${String(month).padStart(2, '0')}`;
+  const lastDay = new Date(year, month, 0).getDate();
+
+  const available = await fromMonth.locator(`option[value="${ym}"]`).count();
+  if (available === 0) {
+    throw new Error(`${year}年${month}月は照会可能期間（過去15ヶ月）の範囲外です。`);
+  }
+
+  await page.selectOption('select[name="sel-1"]', ym);
+  await page.selectOption('select[name="sel-2"]', '01');
+  await page.selectOption('select[name="sel-3"]', ym);
+  await page.selectOption('select[name="sel-4"]', String(lastDay).padStart(2, '0'));
+
+  console.log(`[SmartEX] 照会期間を ${year}年${month}月1日〜${lastDay}日 に設定して再検索します...`);
+  // 再検索ボタンは click しても送信されないことがあるため、
+  // onclick が呼んでいるアクションを直接実行する
+  await page.evaluate(() => window.cfEXPY_doAction('RSWP360AIDP042'));
+  await page.waitForLoadState('domcontentloaded');
+
+  // 再検索はページ遷移を伴い完了タイミングが不安定なため、
+  // 指定した期間が結果欄に反映されるまで待つ（ロケータは遷移をまたいで再試行される）
+  await page
+    .locator('.stat', { hasText: `${year}年${month}月1日` })
+    .first()
+    .waitFor({ timeout: 30000 });
+}
+
+// 一覧の描画完了を待つ。待たずにボタンを数えると描画前の0件を拾うことがある
+// （--debug 有無で結果が変わっていた原因）
+async function waitForReceiptList(page) {
+  await page.waitForFunction(
+    () => {
+      const t = document.body.innerText;
+      return t.includes('合計') || t.includes('該当') || document.querySelectorAll('input[value="領収書表示"]').length > 0;
+    },
+    undefined,
+    { timeout: 30000 }
+  ).catch(() => {});
 }
 
 async function navigateToHistory(page) {
